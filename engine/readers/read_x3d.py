@@ -1,7 +1,7 @@
 """X3D (.x3d, XML encoding) -> triangles. Runs in Blender's Python, no extra libraries. Reads Shape nodes
 (IndexedFaceSet, IndexedTriangleSet, TriangleSet, Box) through Transform/Group/Switch/LOD/Collision/Anchor nodes,
 with DEF/USE; material = Material node (its DEF name, else its colour). Coordinates are used as stored (X3D is in
-metres). The classic encoding (.x3dv) is read by read_wrl.py.
+metres), turned from Y-up to Z-up. The classic encoding (.x3dv) is read by read_wrl.py.
 Writes geometry.npz/json (see geometry_io.py). Usage: read_x3d.py <in.x3d> <outdir>"""
 import os
 import re
@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from geometry_io import DEFAULT_MATERIAL, MeshCollector, colour_name  # noqa: E402
-from read_wrl import box_geometry, transform_matrix, triangulate  # noqa: E402
+from read_wrl import Y_UP_TO_Z_UP, box_geometry, transform_matrix, triangulate  # noqa: E402
 
 GROUPING = {"Group", "Transform", "Collision", "Anchor", "Billboard", "Switch", "LOD", "StaticGroup"}
 SEPARATORS = re.compile(r"[\s,]+")
@@ -137,7 +137,7 @@ def run(src, outdir):
     print("PROGRESS 50 Collecting geometry", flush=True)
     collector = MeshCollector()
     for node in scene:
-        visit(node, np.eye(4), collector, defs)
+        visit(node, Y_UP_TO_Z_UP, collector, defs)
     if not len(collector):
         raise ReadError("No faces found in this X3D file")
     collector.save(outdir)

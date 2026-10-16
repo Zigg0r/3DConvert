@@ -10,7 +10,8 @@ from collections import Counter
 
 import ezdxf
 import numpy as np
-from ezdxf import acis, colors, recover, units
+from ezdxf import colors, recover, units
+from ezdxf.acis import api as acis
 from ezdxf.render import MeshBuilder
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -152,7 +153,7 @@ class Reader:
         elif kind in SOLID_KINDS:
             polygons = []
             for body in acis.load_dxf(entity):
-                for mesh in acis.mesh_from_body(body, merge_lump=True):
+                for mesh in acis.mesh_from_body(body, merge_lumps=True):
                     V = [vec(v) for v in mesh.vertices]
                     polygons += [np.array([V[i] for i in f]) for f in mesh.faces if len(f) >= 3]
             if polygons:

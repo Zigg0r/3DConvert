@@ -1,6 +1,6 @@
 """VRML97 (.wrl) -> triangles. Runs in Blender's Python. Reads Shape nodes (IndexedFaceSet, Box) through
 Transform/Group/Switch/LOD/Anchor/Collision nodes; material = Material node (its DEF name, else its colour).
-Coordinates are used as stored, nothing is moved.
+Coordinates are used as stored (metres), turned from Y-up to Z-up.
 Writes geometry.npz/json (see geometry_io.py). Usage: read_wrl.py <in.wrl> <outdir>"""
 import gzip
 import math
@@ -19,6 +19,8 @@ TOKEN = re.compile(r'#[^\n]*|"(?:[^"\\]|\\.)*"|[\[\]{}]|[^\s,\[\]{}"#]+')
 NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$")
 GROUPING = {"Group", "Transform", "Collision", "Anchor", "Billboard", "Switch", "LOD", "Inline"}
 MAX_DEPTH = 60
+# VRML and X3D are Y-up (like Blender's own importer assumes); the result is Z-up
+Y_UP_TO_Z_UP = np.array([[1.0, 0, 0, 0], [0, 0, -1.0, 0], [0, 1.0, 0, 0], [0, 0, 0, 1.0]])
 
 
 class ReadError(Exception):
@@ -278,7 +280,7 @@ def run(src, outdir):
     print("PROGRESS 50 Collecting geometry", flush=True)
     collector = MeshCollector()
     for node in nodes:
-        visit(node, np.eye(4), collector)
+        visit(node, Y_UP_TO_Z_UP, collector)
     if not len(collector):
         raise ReadError("No faces found in this VRML file")
     collector.save(outdir)

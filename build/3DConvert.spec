@@ -18,6 +18,7 @@ for root, dirs, files in os.walk(ENGINE):
 # program icons of the supported-formats page (a PNG named after a program replaces its drawn badge)
 icon_datas = [(os.path.join(ASSETS, 'icons', f), os.path.join('assets', 'icons'))
               for f in os.listdir(os.path.join(ASSETS, 'icons')) if f.endswith('.png')]
+icon_datas.append((os.path.join(ASSETS, 'languages.json'), 'assets'))
 
 a = Analysis(
     [os.path.join(APP, 'main.py')],

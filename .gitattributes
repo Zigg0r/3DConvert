@@ -1,5 +1,7 @@
 * text=auto
 *.bat text eol=crlf
 *.whl binary
+*.dll binary
+*.exe binary
 *.ico binary
 *.png binary

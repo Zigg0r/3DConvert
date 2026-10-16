@@ -14,9 +14,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from geometry_io import DEFAULT_MATERIAL, MeshCollector  # noqa: E402
+from polygons import triangulate_rings  # noqa: E402
 
 NS = "{http://www.collada.org/2005/11/COLLADASchema}"
 MAX_DEPTH = 40
+UP_AXIS = {"value": "Z_UP"}
 GREY = [0.8, 0.8, 0.8]
 
 
@@ -49,20 +51,89 @@ def read_geometry(element):
         return None
     V = numbers(sources[position]).reshape(-1, 3)
     parts = []
-    for tri in mesh.findall(q("triangles")):
-        inputs = tri.findall(q("input"))
-        stride = max(int(i.get("offset")) for i in inputs) + 1
-        offset = [int(i.get("offset")) for i in inputs if i.get("semantic") == "VERTEX"][0]
-        p = tri.find(q("p"))
-        if p is None or not p.text:
-            continue
-        parts.append((tri.get("material"), numbers(p.text, np.int64)[offset::stride].reshape(-1, 3)))
+    for kind in ("triangles", "polylist", "polygons"):
+        for prim in mesh.findall(q(kind)):
+            inputs = prim.findall(q("input"))
+            stride = max(int(i.get("offset")) for i in inputs) + 1
+            offset = [int(i.get("offset")) for i in inputs if i.get("semantic") == "VERTEX"][0]
+            if kind == "triangles":
+                p = prim.find(q("p"))
+                if p is None or not p.text:
+                    continue
+                F = numbers(p.text, np.int64)[offset::stride].reshape(-1, 3)
+            elif kind == "polylist":
+                p, vcount = prim.find(q("p")), prim.find(q("vcount"))
+                if p is None or not p.text or vcount is None or not vcount.text:
+                    continue
+                F = polygon_triangles(numbers(vcount.text, np.int64), numbers(p.text, np.int64)[offset::stride], V)
+            else:  # <polygons>: one <p> per polygon
+                flat, counts = [], []
+                for p in prim.findall(q("p")):
+                    if p.text:
+                        ring = numbers(p.text, np.int64)[offset::stride]
+                        flat.append(ring)
+                        counts.append(len(ring))
+                if not flat:
+                    continue
+                F = polygon_triangles(np.array(counts, np.int64), np.concatenate(flat), V)
+            if len(F):
+                parts.append((prim.get("material"), F))
     return (V, parts) if parts else None
 
 
+def polygon_triangles(counts, flat, V):
+    """Polygons (vertex counts and the vertex indices one after the other) -> triangles (m, 3): triangles as they are,
+    quads cut along the diagonal that stays inside, larger polygons by ear clipping."""
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    out = []
+    for n in np.unique(counts):
+        if n < 3:
+            continue
+        idx = flat[starts[counts == n][:, None] + np.arange(n)]
+        if n == 3:
+            out.append(idx)
+        elif n == 4:
+            P = V[idx]
+            inside = (np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0]) * np.cross(P[:, 2] - P[:, 0], P[:, 3] - P[:, 0])).sum(1) >= 0
+            out.append(np.where(inside[:, None], idx[:, [0, 1, 2]], idx[:, [0, 1, 3]]))
+            out.append(np.where(inside[:, None], idx[:, [0, 2, 3]], idx[:, [1, 2, 3]]))
+        else:
+            for ring in idx:
+                try:
+                    tri = triangulate_rings([V[ring]])
+                except Exception:  # noqa: BLE001 - degenerate polygon
+                    tri = np.zeros((0, 3), np.int64)
+                if not len(tri):
+                    tri = np.array([[0, i, i + 1] for i in range(1, n - 1)])  # plain fan
+                out.append(ring[tri])
+    return np.concatenate(out) if out else np.zeros((0, 3), np.int64)
+
+
 def read_matrix(node):
-    m = node.find(q("matrix"))
-    return numbers(m.text).reshape(4, 4) if m is not None else np.eye(4)
+    """Node transform: <matrix>, <translate>, <rotate>, <scale> multiplied in document order."""
+    result = np.eye(4)
+    for element in node:
+        tag = element.tag.rsplit("}", 1)[-1]
+        if tag not in ("matrix", "translate", "rotate", "scale") or not element.text:
+            continue
+        v = numbers(element.text)
+        m = np.eye(4)
+        if tag == "matrix" and len(v) >= 16:
+            m = v[:16].reshape(4, 4)
+        elif tag == "translate" and len(v) >= 3:
+            m[:3, 3] = v[:3]
+        elif tag == "scale" and len(v) >= 3:
+            m[0, 0], m[1, 1], m[2, 2] = v[:3]
+        elif tag == "rotate" and len(v) >= 4:
+            axis = v[:3] / (np.linalg.norm(v[:3]) or 1.0)
+            a = np.radians(v[3])
+            c, s = np.cos(a), np.sin(a)
+            x, y, z = axis
+            m[:3, :3] = [[c + x * x * (1 - c), x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+                         [y * x * (1 - c) + z * s, c + y * y * (1 - c), y * z * (1 - c) - x * s],
+                         [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)]]
+        result = result @ m
+    return result
 
 
 def read_node(node):
@@ -89,12 +160,17 @@ def read_file(path):
     parents = []
     for event, element in ET.iterparse(path, events=("start", "end")):
         if event == "start":
+            if not parents:  # the namespace differs per COLLADA version (1.4: 2005/11, 1.5: 2008/03)
+                global NS
+                NS = element.tag[:element.tag.index("}") + 1] if element.tag.startswith("{") else ""
             parents.append(element.tag)
             continue
         parents.pop()
         tag = element.tag
         if tag == q("unit"):
             unit = float(element.get("meter") or 1.0)
+        elif tag == q("up_axis"):
+            UP_AXIS["value"] = (element.text or "Z_UP").strip().upper()
         elif tag == q("effect"):
             colour = GREY
             c = element.find(".//" + q("diffuse") + "/" + q("color"))
@@ -172,11 +248,15 @@ def run(path, outdir):
             material_id = bound.get(symbol, symbol)
             name = names.get(material_id, material_id or DEFAULT_MATERIAL)
             world = ((V.astype(np.float64) + centre) @ matrix[:3, :3].T + matrix[:3, 3]) * unit
+            if UP_AXIS["value"] == "Y_UP":  # COLLADA files say which axis points up; the result is Z-up
+                world = np.stack([world[:, 0], -world[:, 2], world[:, 1]], axis=1)
+            elif UP_AXIS["value"] == "X_UP":
+                world = np.stack([world[:, 1], world[:, 2], world[:, 0]], axis=1)
             collector.add(name, world, F, False, colours.get(name))
         if n % step == 0:
             print("PROGRESS %d Placing geometry %d/%d" % (10 + 85 * n // len(found), n + 1, len(found)), flush=True)
     if not len(collector):
-        print("No triangles found in this COLLADA file (only <triangles> geometry is read).", file=sys.stderr, flush=True)
+        print("No triangles or polygons found in this COLLADA file.", file=sys.stderr, flush=True)
         return 1
     collector.save(outdir)
     print("done: %d placements, %d triangles in %d meshes [%.0fs]"

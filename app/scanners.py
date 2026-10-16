@@ -677,7 +677,8 @@ def scan_dwg(path, progress):
 
     return base_rows(path, ".dwg") + [
         ("AutoCAD version", ACAD_VERSIONS.get(tag, tag)),
-        ("ODA File Converter", "found" if find_oda_converter() else "not installed (needed to convert DWG)"),
+        ("ODA File Converter", "found" if find_oda_converter() else "not installed (the built-in LibreDWG reads the DWG, "
+                                                                     "without 3D solids of 2013+ files)"),
     ]
 
 
@@ -807,6 +808,95 @@ def scan_ifcxml(path, progress):
     return base_rows(path, ".ifcxml") + [("Note", "Converted to IFC text with IfcOpenShell before it is read")]
 
 
+# ---------------------------------------------------------------- GIS: GeoTIFF, GeoJSON
+TIFF_COMPRESSION = {1: "none", 5: "LZW", 7: "JPEG", 8: "Deflate", 32773: "PackBits", 32946: "Deflate", 34925: "LZMA",
+                    50000: "Zstandard"}
+
+
+def scan_geotiff(path, progress):
+    """Size, cell size and CRS from the first IFD of a (Big)TIFF, with struct only."""
+    rows = base_rows(path, os.path.splitext(path)[1].lower())
+    with open(path, "rb") as f:
+        head = f.read(16)
+        e = "<" if head[:2] == b"II" else ">" if head[:2] == b"MM" else None
+        magic = struct.unpack(e + "H", head[2:4])[0] if e else 0
+        if magic not in (42, 43):
+            return rows + [("Note", "not a TIFF file")]
+        big = magic == 43
+        offset = struct.unpack(e + ("Q" if big else "I"), head[8:16] if big else head[4:8])[0]
+        f.seek(offset)
+        count = struct.unpack(e + ("Q" if big else "H"), f.read(8 if big else 2))[0]
+        size, inline = (20, 8) if big else (12, 4)
+        tags = {}
+        for entry in (f.read(size) for _ in range(count)):
+            tag, kind = struct.unpack(e + "HH", entry[:4])
+            n = struct.unpack(e + ("Q" if big else "I"), entry[4:4 + inline])[0]
+            tags[tag] = (kind, n, entry[4 + inline:])
+
+        def values(tag, limit=64):
+            if tag not in tags:
+                return []
+            kind, n, field = tags[tag]
+            width = {1: 1, 2: 1, 3: 2, 4: 4, 6: 1, 7: 1, 8: 2, 9: 4, 11: 4, 12: 8, 16: 8, 17: 8}.get(kind)
+            if not width:
+                return []
+            n = min(n, limit)
+            if n * width > inline:
+                f.seek(struct.unpack(e + ("Q" if big else "I"), field)[0])
+                data = f.read(n * width)
+            else:
+                data = field[:n * width]
+            fmt = {1: "B", 2: "s", 3: "H", 4: "I", 6: "b", 7: "B", 8: "h", 9: "i", 11: "f", 12: "d", 16: "Q", 17: "q"}[kind]
+            if kind == 2:
+                return [data.split(b"\0")[0].decode("latin-1")]
+            return list(struct.unpack(e + fmt * n, data))
+
+        width, height = (values(256) or [0])[0], (values(257) or [0])[0]
+        bits, bands = (values(258) or [0])[0], (values(277) or [1])[0]
+        sample = {1: "unsigned integer", 2: "signed integer", 3: "float"}.get((values(339) or [1])[0], "?")
+        scale, keys = values(33550), values(34735, 400)
+        epsg = None
+        for k in range(int(keys[3]) if len(keys) > 3 else 0):
+            key, location, _, value = keys[4 + 4 * k:8 + 4 * k]
+            if key in (3072, 2048) and location == 0 and value not in (0, 32767):
+                epsg = epsg or value
+        nodata = (values(42113) or [""])[0]
+        compression = TIFF_COMPRESSION.get((values(259) or [1])[0], "other")
+        georeferenced = bool(scale or values(34264, 16))
+    rows += [("Raster size", f"{num(width)} x {num(height)} cells"),
+             ("Data", f"{bits}-bit {sample}, {bands} band(s)" + ("" if bands == 1 else " (images are not converted)")),
+             ("Compression", compression),
+             ("Georeference", "GeoTIFF tags" if georeferenced else "none (a world file may sit next to it)")]
+    if scale:
+        rows.append(("Cell size", f"{scale[0]:.4g} x {scale[1]:.4g} (CRS units)"))
+        rows.append(("Extent", f"{width * scale[0]:,.0f} x {height * scale[1]:,.0f} (CRS units)"))
+    rows.append(("CRS", f"EPSG:{epsg}" if epsg else "not stated"))
+    if nodata:
+        rows.append(("Nodata value", nodata[:24]))
+    return rows
+
+
+def scan_geojson(path, progress):
+    rows = base_rows(path, os.path.splitext(path)[1].lower())
+    if os.path.getsize(path) > 80 * 1024 * 1024:
+        return rows + [("Note", "large file: not scanned, the conversion reads it in full")]
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return rows + [("Note", "not valid JSON")]
+    progress(60)
+    features = data.get("features") if isinstance(data, dict) else None
+    if features is None:
+        features = [data] if isinstance(data, dict) else []
+    kinds = Counter(((f or {}).get("geometry") or f or {}).get("type", "?") for f in features if isinstance(f, dict))
+    crs = (((data.get("crs") or {}).get("properties") or {}).get("name") if isinstance(data, dict) else None) or ""
+    rows += [("Features", num(len(features))),
+             ("Geometry types", ", ".join(f"{k} {v}" for k, v in kinds.most_common(4)) or "-"),
+             ("CRS", crs or "not stated (WGS 84 longitude/latitude assumed when the values fit)")]
+    return rows
+
+
 # ---------------------------------------------------------------- via Blender (3DM, SketchUp, USD, Alembic, MAX)
 def scan_with_blender(path, ext, progress):
     progress(20)
@@ -830,7 +920,8 @@ def describe_file(path, progress):
                 ".3ds": scan_3ds, ".dae": scan_dae, ".ifc": scan_ifc, ".stp": scan_step, ".step": scan_step,
                 ".igs": scan_iges, ".iges": scan_iges,
                 ".dxf": scan_dxf, ".dwg": scan_dwg, ".wrl": scan_wrl, ".x3dv": scan_wrl, ".x3d": scan_x3d,
-                ".3mf": scan_3mf, ".amf": scan_amf, ".ifczip": scan_ifczip, ".ifcxml": scan_ifcxml}
+                ".3mf": scan_3mf, ".amf": scan_amf, ".ifczip": scan_ifczip, ".ifcxml": scan_ifcxml,
+                ".tif": scan_geotiff, ".tiff": scan_geotiff, ".geojson": scan_geojson, ".json": scan_geojson}
     if ext in scanners:
         rows = scanners[ext](path, progress)
         progress(100)

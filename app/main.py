@@ -1,6 +1,10 @@
+﻿import json
 import os
 import re
+import shutil
 import sys
+import tempfile
+import threading
 from html import escape
 
 try:
@@ -37,19 +41,23 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from formats import EXPORT_HINTS, NATIVE_FORMATS, PROGRAMS, SUPPORTED, program_status
+from formats import (EXPORT_HINTS, FULL, LIMITED, NATIVE_FORMATS, PARTIAL, PROGRAMS, SUPPORTED, UNTESTED,
+                     program_status)
 from icon import cube_icon, cube_pixmap
-from pipeline import ConvertError, Converter, blender_status, cancel_scan, steps_for, unique_path
+from jobs import BUDGET_SHARE, job_for, memory_mb, run_jobs, worker_count
+from pipeline import (NATIVE, ConvertError, Converter, blender_installs, blender_status, cancel_scan, ensure_libs,
+                      reset_log, set_blender_path, steps_for, unique_path)
 from scanners import describe_file
 
 APP_NAME = "3DConvert"
-APP_VERSION = "v1.10"  # bump with every edit, together with LAST_UPDATE
-LAST_UPDATE = "2026-10-14"
+APP_VERSION = "v1.21"  # bump with every edit, together with LAST_UPDATE
+LAST_UPDATE = "2026-10-16"
 
 
 def format_note(ext):
@@ -450,12 +458,36 @@ class ElidedLabel(QLabel):
         self._full = text
         self._elide()
 
+    def minimumSizeHint(self):
+        # without this the width of the shown text is the minimum, and one long text widens its whole page
+        return QSize(0, super().minimumSizeHint().height())
+
     def _elide(self):
         self.setText(QFontMetrics(self.font()).elidedText(self._full, Qt.ElideMiddle, self.width()))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._elide()
+
+
+class ClickLabel(ElidedLabel):
+    """ElidedLabel that emits `clicked` while it is switched on."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._active = False
+
+    def set_clickable(self, on):
+        self._active = on
+        self.setCursor(Qt.PointingHandCursor if on else Qt.ArrowCursor)
+
+    def mousePressEvent(self, e):
+        if self._active and e.button() == Qt.LeftButton:
+            self.clicked.emit()
+        else:
+            super().mousePressEvent(e)
 
 
 def folder_icon() -> QIcon:
@@ -623,6 +655,9 @@ class ReadWorker(QThread):
 
 
 class ConvertWorker(QThread):
+    """Converts the files, several at once while they fit the RAM budget (see jobs.py). The window follows the
+    'lead' file: the running file that was added first; the progress bar is the average over all files."""
+
     progress = Signal(int, str)
     step = Signal(str)
     file_started = Signal(int, int, str)  # index, total, source path
@@ -633,63 +668,174 @@ class ConvertWorker(QThread):
         self.sources = list(sources)
         self.folders = list(folders)  # output folder per source (combined: the first one is used)
         self.combined = combined
-        self.converter = Converter(self.progress.emit, self.step.emit, cleanup_off)
+        self.cleanup_off = tuple(cleanup_off)
+        self._lock = threading.Lock()
+        self._converters = []
+        self._cancelled = False
+        self._pct = [0.0] * len(self.sources)
+        self._last_step = {}
+        self._running = []
+        self._lead = None
+        self._reserve = 0.0  # share of the progress bar kept for combining the files
+
+    # ---- progress of the files that run at the same time
+    def _on_progress(self, i, pct, text):
+        with self._lock:
+            self._pct[i] = pct
+            overall = sum(self._pct) / len(self._pct) * (1 - self._reserve)
+        self.progress.emit(int(overall), text)
+
+    def _on_step(self, i, name):
+        with self._lock:
+            self._last_step[i] = name
+            lead = self._lead == i
+        if lead:
+            self.step.emit(name)
+
+    def _set_running(self, i, running):
+        with self._lock:
+            if running:
+                self._running.append(i)
+            elif i in self._running:
+                self._running.remove(i)
+            lead = min(self._running) if self._running else self._lead
+            changed = lead != self._lead
+            self._lead = lead
+            step = self._last_step.get(lead)
+        if changed and lead is not None:
+            self.file_started.emit(lead, len(self.sources), self.sources[lead])
+            if step:
+                self.step.emit(step)
+
+    def _new_converter(self, i, combine_mark):
+        converter = Converter(lambda pct, text: self._on_progress(i, pct, text), lambda name: self._on_step(i, name),
+                              self.cleanup_off)
+        if combine_mark:
+            converter._env_extra["COMBINE_MARK"] = "1"  # cleanup.py then remembers which objects are hidden
+        with self._lock:
+            self._converters.append(converter)
+            if self._cancelled:
+                converter.cancel()
+        return converter
+
+    def _convert_files(self, targets, combined):
+        """Converts source i to targets[i]. Returns ([indices that worked], [(file name, message)])."""
+        succeeded, failures = [], []
+        total_mb, free_mb = memory_mb()
+        budget = int(free_mb * BUDGET_SHARE)
+        jobs = [job_for(i, src) for i, src in enumerate(self.sources)]
+        workers = worker_count(len(jobs), budget)
+        if any(os.path.splitext(s)[1].lower() not in NATIVE for s in self.sources):
+            try:
+                ensure_libs()  # unpack once here, not in several conversions at the same time
+            except Exception:  # noqa: BLE001 - each conversion reports its own problem
+                pass
+        note = (f"RAM {total_mb} MB, free {free_mb} MB, budget {budget} MB (80% of free); "
+                f"{workers} conversion(s) at once")
+
+        def run_one(job):
+            i = job["index"]
+            name = os.path.basename(self.sources[i])
+            converter = self._new_converter(i, combined)
+            converter._log.append(note)
+            self._set_running(i, True)
+            try:
+                converter.convert(self.sources[i], targets[i], final=not combined)
+                with self._lock:
+                    succeeded.append(i)
+            except ConvertError as ex:
+                with self._lock:
+                    failures.append((name, str(ex)))
+            except Exception as ex:  # noqa: BLE001 - one bad file must not stop the others
+                with self._lock:
+                    failures.append((name, f"Unexpected error: {ex}"))
+            finally:
+                with self._lock:
+                    self._pct[i] = 100
+                self._set_running(i, False)
+
+        run_jobs(jobs, run_one, budget, workers, lambda: self._cancelled)
+        return sorted(succeeded), failures
 
     def run(self):
-        total = len(self.sources)
         saved, failures = [], []
+        reset_log()
         try:
             if self.combined:
-                stem = os.path.splitext(os.path.basename(self.sources[0]))[0]
-                target = unique_path(self.folders[0], stem if total == 1 else f"{stem} + {total - 1} more")
-                failures = self.converter.convert_combined(
-                    self.sources, target, lambda i, n, src: self.file_started.emit(i, n, src))
-                saved.append(target)
+                saved, failures = self._run_combined()
             else:
-                for i, src in enumerate(self.sources):
-                    name = os.path.basename(src)
-                    self.file_started.emit(i, total, src)
-                    self.converter.set_slot(i, total)
-                    try:
-                        target = unique_path(self.folders[i], os.path.splitext(name)[0])
-                        self.converter.convert(src, target)
-                        saved.append(target)
-                    except ConvertError as ex:
-                        failures.append((name, str(ex)))
-                        if self.converter.cancelled:
-                            break
-                    except Exception as ex:  # noqa: BLE001 - one bad file must not stop the others
-                        failures.append((name, f"Unexpected error: {ex}"))
+                targets = []
+                for src, folder in zip(self.sources, self.folders):
+                    target = unique_path(folder, os.path.splitext(os.path.basename(src))[0])
+                    n = 1
+                    while target in targets:  # two sources with the same name must not write the same file
+                        target = unique_path(folder, f"{os.path.splitext(os.path.basename(src))[0]} ({n})")
+                        n += 1
+                    targets.append(target)
+                ok, failures = self._convert_files(targets, False)
+                saved = [targets[i] for i in ok]
         except ConvertError as ex:
             failures.append(("", str(ex)))
         except Exception as ex:  # noqa: BLE001 - never let the thread die silently
             failures.append(("", f"Unexpected error: {ex}"))
         self.done.emit(saved, failures)
 
+    def _run_combined(self):
+        total = len(self.sources)
+        stem = os.path.splitext(os.path.basename(self.sources[0]))[0]
+        target = unique_path(self.folders[0], stem if total == 1 else f"{stem} + {total - 1} more")
+        work = tempfile.mkdtemp(prefix="3dconvert_")
+        try:
+            self._reserve = 0.1
+            parts = [os.path.join(work, f"part{i}.blend") for i in range(total)]
+            ok, failures = self._convert_files(parts, True)
+            if self._cancelled:
+                raise ConvertError("Cancelled")
+            if not ok:
+                raise ConvertError("No file could be converted.\n" + "\n".join(f"{n}: {m}" for n, m in failures))
+            names = [os.path.basename(s) for s in self.sources]
+            stems = [os.path.splitext(n)[0] for n in names]
+            entries = [{"blend": parts[i], "name": names[i] if stems.count(stems[i]) > 1 else stems[i]} for i in ok]
+            combiner = Converter(self.progress.emit, self.step.emit, self.cleanup_off)
+            with self._lock:
+                self._converters.append(combiner)
+                if self._cancelled:
+                    combiner.cancel()
+            combiner.combine(entries, target, work)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return [target], failures
+
     def cancel(self):
-        self.converter.cancel()
+        with self._lock:
+            self._cancelled = True
+            converters = list(self._converters)
+        for converter in converters:
+            converter.cancel()
 
 
 class SizePage(QWidget):
     """What the program's file size is made of (measured on the built exe, MB)."""
 
     ROWS = [
-        ("IfcOpenShell (IFC)", 36.8),
-        ("Qt / PySide6 (the window)", 19.8),
-        ("cascadio / OpenCASCADE (STEP, IGES)", 13.0),
-        ("Python runtime, splash, app code", 10.3),
-        ("SketchUp API (SKP)", 4.8),
-        ("ezdxf (DXF / DWG)", 2.5),
-        ("fontTools (needed by ezdxf)", 2.1),
-        ("rhino3dm (3DM)", 1.9),
-        ("shapely (geometry helper)", 1.4),
-        ("Other small libraries & packaging", 1.1),
+        ("IfcOpenShell (IFC)", 35.6),
+        ("Qt / PySide6 (the window)", 18.9),
+        ("Python runtime, splash, app code", 18.3),
+        ("cascadio / OpenCASCADE (STEP, IGES)", 12.4),
+        ("LibreDWG (DWG)", 7.6),
+        ("SketchUp API (SKP)", 4.6),
+        ("Point clouds & ASSIMP formats", 3.7),
+        ("ezdxf (DXF)", 2.4),
+        ("fontTools (needed by ezdxf)", 2.0),
+        ("rhino3dm (3DM)", 1.8),
+        ("shapely (geometry helper)", 1.3),
+        ("Other small libraries & packaging", 1.2),
     ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        note = QLabel("Most of the size is conversion libraries.\nThey are unpacked to "
-                      "%LOCALAPPDATA%\\3DConvert\\libs the first time a format needs them.")
+        note = QLabel("Conversion libraries are unpacked to "
+                      "%LOCALAPPDATA%\\3DConvert\\libs when first needed.")
         note.setObjectName("infoMsg")
         note.setWordWrap(True)
 
@@ -713,51 +859,51 @@ class SizePage(QWidget):
             grid.addWidget(key, r, 0)
             grid.addWidget(bar, r, 1, Qt.AlignVCenter)
             grid.addWidget(size, r, 2)
-        total = QLabel(f"Total: {sum(mb for _, mb in self.ROWS):.1f} MB")
-        total.setObjectName("infoHeader")
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
         lay.addWidget(note)
-        lay.addSpacing(16)  # one text line
         lay.addLayout(grid)
         lay.addStretch(1)
-        lay.addWidget(total, alignment=Qt.AlignRight)
+
+    @classmethod
+    def total_mb(cls):
+        return sum(mb for _, mb in cls.ROWS)
 
 
 # (key used by engine/in_blender/cleanup.py, name, one-line explanation); shown sorted by name
 CLEANUP_STEPS = [
-    ("merge", "Duplicate vertices merged", "Welds vertices closer than 0.1 mm."),
-    ("degenerate", "Degenerate geometry dissolved", "Removes zero-area faces and zero-length edges."),
-    ("loose", "Loose edges and points removed", "Deletes stray edges and vertices without faces."),
-    ("normals", "Normals recalculated", "Points every face outward, consistently."),
-    ("quads", "Clean face layout", "Triangulates, then rejoins nearly flat faces into quads."),
-    ("flat", "Flat shading, no marks", "Clears smooth shading, sharp edges and UV seams."),
-    ("leftovers", "Importer leftovers removed", "Drops ios_* data, paint masks, skin and custom normals."),
-    ("slots", "Unused material slots dropped", "Removes material slots that no face uses."),
-    ("materials", "Simple materials", "Plain base colour only: no textures or transparency."),
-    ("hidden", "Hidden things sorted", "Moves hidden objects to the !HIDDEN collection."),
+    ("merge", "Duplicate vertices merged", "Welds vertices closer than 0.1 mm, so touching faces share their corners."),
+    ("degenerate", "Degenerate geometry dissolved", "Removes faces without area and edges without length; they only cause errors."),
+    ("loose", "Loose edges and points removed", "Deletes stray edges and vertices that no face uses."),
+    ("normals", "Normals recalculated", "Points every face outward, consistently, so shading and lighting look right."),
+    ("quads", "Clean face layout", "Triangulates, then rejoins nearly flat triangles into quads for a tidier mesh."),
+    ("flat", "Flat shading, no marks", "Clears smooth shading, sharp-edge marks and UV seams; every face shades flat."),
+    ("leftovers", "Importer leftovers removed", "Drops ios_* data, paint masks, skin data and custom normals from importers."),
+    ("slots", "Unused material slots dropped", "Removes material slots that no face uses, so only real materials are listed."),
+    ("materials", "Simple materials", "Plain base colour only: no textures, transparency or complex shader nodes."),
+    ("hidden", "Hidden things sorted", "Moves objects hidden in the source file to the !HIDDEN collection."),
     ("purge", "Orphan data purged", "Clears unused meshes, materials and images, repeated until none are left."),
-    ("orphans", "Stray objects removed", "Deletes objects that sit in no scene or collection."),
+    ("orphans", "Stray objects removed", "Deletes objects that sit in no scene or collection (invisible leftovers)."),
     ("animation", "Animation removed", "Clears keyframes, drivers and actions; objects keep their current pose."),
-    ("armatures", "Bones and armatures removed", "Deletes armatures, bone weight groups and armature modifiers."),
-    ("modifiers", "Modifiers removed", "Deletes all modifiers without applying them; the name gets a note."),
+    ("armatures", "Bones and armatures removed", "Deletes armatures (rigs), bone weight groups and armature modifiers."),
+    ("modifiers", "Modifiers removed", "Deletes all modifiers without applying them; the object name gets a note."),
     ("physics", "Physics removed", "Clears cloth, soft body, rigid body, particles, fluid and force fields."),
-    ("unparent", "Parents cleared, position kept", "Clear Parent + Keep Transform on every object."),
-    ("empties", "Empty objects removed", "Deletes empties (the tilted-Y icons); children keep their place."),
-    ("duplicates", "Duplicate faces and objects removed", "Deletes faces on the same vertices and identical objects in place."),
-    ("mergemats", "Materials merged by colour", "Combines materials with the same colour into one."),
-    ("uvcolor", "UV maps and colours removed", "Deletes UV maps and vertex colour attributes."),
+    ("unparent", "Parents cleared, position kept", "Clear Parent + Keep Transform on every object: no hierarchy, same positions."),
+    ("empties", "Empty objects removed", "Deletes empties (the axes and group icons); their children keep their place."),
+    ("duplicates", "Duplicate faces and objects removed", "Deletes faces on the same vertices and identical objects in the same place."),
+    ("mergemats", "Materials merged by colour", "Combines materials with the same colour into one, so the list stays short."),
+    ("uvcolor", "UV maps and colours removed", "Deletes UV maps and vertex colour attributes; colour comes from the materials."),
     ("extras", "Extra mesh data removed", "Clears shape keys, weight groups, bevel/crease weights, custom properties."),
-    ("camlight", "Cameras, lights and world removed", "Deletes cameras, lights and the world from the file."),
-    ("emptymesh", "Empty meshes removed", "Deletes mesh objects without any faces or edges."),
-    ("applyts", "Scale and rotation applied", "Bakes scale and rotation into the mesh; positions stay the same."),
-    ("names", "Names tidied", "Strips .001 suffixes when free and deletes empty collections."),
-    ("tomesh", "Curves and text turned into meshes", "Converts curves, surfaces, text and metaballs to mesh objects."),
-    ("unhide", "Hidden geometry unhidden", "Unhides faces, edges and vertices hidden inside meshes."),
-    ("scene", "Scene tidied", "One scene, metric units at scale 1, timeline reset."),
-    ("viewport", "Stuck-invisible objects fixed", "Turns Show in Viewport back on; hiding stays on the eye icon."),
+    ("camlight", "Cameras, lights and world removed", "Deletes cameras, lights and the world (sky and ambient) from the file."),
+    ("emptymesh", "Empty meshes removed", "Deletes mesh objects without any faces or edges, as there is nothing to show."),
+    ("applyts", "Scale and rotation applied", "Bakes scale and rotation into the mesh so they read 1 and 0; positions stay."),
+    ("names", "Names tidied", "Strips .001 suffixes when the plain name is free; deletes empty collections."),
+    ("tomesh", "Curves and text turned into meshes", "Converts curves, surfaces, text and metaballs to real mesh objects."),
+    ("unhide", "Hidden geometry unhidden", "Unhides faces, edges and vertices that were hidden inside the meshes."),
+    ("scene", "Scene tidied", "One scene, metric units at scale 1, timeline reset to frames 1 to 250."),
+    ("viewport", "Stuck-invisible objects fixed", "Turns Show in Viewport back on; the hiding stays on the eye icon instead."),
 ]
 
 
@@ -872,8 +1018,7 @@ class CleanupScreen(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("infoBox")
-        header = QLabel("Cleanup steps")
+        header = QLabel("Cleanup steps within Blender")
         header.setObjectName("infoHeader")
         note = QLabel("Untick the steps you do not want during conversion.")
         note.setObjectName("footer")
@@ -949,7 +1094,7 @@ def program_icon(name, size=32):
     return badge_pixmap(name, size)
 
 
-STATUS_COLOURS = {"Supported": "#8fd6a1", "Partially tested": "#f6b98a", "Not tested": "#767a86"}
+STATUS_COLOURS = {FULL: "#8fd6a1", LIMITED: "#f3e6a0", PARTIAL: "#f6b98a", UNTESTED: "#767a86"}
 
 
 class Orb(QWidget):
@@ -1013,7 +1158,6 @@ class FormatsScreen(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("infoBox")
         header = QLabel("Supported file formats")
         header.setObjectName("infoHeader")
         native_note = QLabel("* Format native to Blender import")
@@ -1045,17 +1189,13 @@ class FormatsScreen(QFrame):
 
         legend = QHBoxLayout()
         legend.setSpacing(5)
-        gap = QFontMetrics(native_note.font()).horizontalAdvance("   ")  # three spaces between the entries
         for status in STATUS_COLOURS:
             text = QLabel(status)
             text.setObjectName("footer")
+            legend.addStretch(1)  # equal gaps before, between and after the entries
             legend.addWidget(Orb(status))
             legend.addWidget(text)
-            legend.addSpacing(gap)
         legend.addStretch(1)
-        support_note = QLabel("Extended support is being tested.")
-        support_note.setObjectName("footer")
-        legend.addWidget(support_note)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 12, 10, 12)
         lay.setSpacing(8)
@@ -1064,14 +1204,93 @@ class FormatsScreen(QFrame):
         lay.addLayout(legend)
 
 
-class InfoScreen(QFrame):
-    """Program size breakdown; update note and AI disclaimer at the bottom."""
+class LanguageBar(QWidget):
+    """GitHub-style language breakdown of what the program is made of: a segmented bar with a legend under it.
+    Reads assets/languages.json (written by build/language_stats.py); stays empty when that file is missing."""
+
+    COLOURS = {"Python": "#3572A5", "C++": "#f34b7d", "C": "#555555", "Rust": "#dea584", "Batchfile": "#C1F12E"}  # GitHub's colours
+    BAR_H, GAP = 8, 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("infoBox")
+        try:
+            with open(os.path.join(os.path.dirname(icons_dir()), "languages.json"), encoding="utf-8") as f:
+                sizes = json.load(f)
+        except (OSError, ValueError):
+            sizes = {}
+        total = sum(sizes.values()) or 1
+        self._parts = [(name, size / total, QColor(self.COLOURS.get(name, "#8b8f9a"))) for name, size in sizes.items()]
+        self._font = QFont(self.font())
+        self._font.setPixelSize(11)
+        self._bold = QFont(self._font)
+        self._bold.setBold(True)
+        self.setFixedHeight(self.BAR_H + 7 + 14)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # as wide as the page
+        self.setVisible(bool(self._parts))
+
+    @staticmethod
+    def _percent(share):
+        return "<0.1%" if 0 < share < 0.001 else f"{share * 100:.1f}%"
+
+    def _widths(self):
+        """Segment widths summing to the bar width; a tiny share gets a minimum width (the scale is then not exact)."""
+        least = 8
+        full = self.width()
+        small = [s * full < least for _, s, _ in self._parts]
+        room = full - least * sum(small)
+        big_total = sum(s for (_, s, _), tiny in zip(self._parts, small) if not tiny) or 1
+        return [least if tiny else s / big_total * room for (_, s, _), tiny in zip(self._parts, small)]
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setFont(self._font)
+        widths = self._widths()
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, self.width(), self.BAR_H), self.BAR_H / 2, self.BAR_H / 2)
+        p.setClipPath(clip)
+        x = 0.0
+        for (_, _, colour), width in zip(self._parts, widths):
+            p.fillRect(QRectF(x, 0, width, self.BAR_H), colour)
+            x += width
+        p.setClipping(False)
+        p.setPen(QPen(QColor("#1e1f24"), self.GAP))  # window colour: separates the segments
+        x = 0.0
+        for width in widths[:-1]:
+            x += width
+            p.drawLine(QPointF(x, 0), QPointF(x, self.BAR_H))
+        metrics = QFontMetrics(self._font)
+        bold_metrics = QFontMetrics(self._bold)
+        labels = [(name, self._percent(share), colour) for name, share, colour in self._parts]
+        item_w = [12 + bold_metrics.horizontalAdvance(name) + 4 + metrics.horizontalAdvance(text) for name, text, _ in labels]
+        gap = (self.width() - sum(item_w)) / max(len(labels) - 1, 1)  # the same distance between all entries
+        x, baseline = 0.0, self.BAR_H + 7 + 11
+        for (name, text, colour), width in zip(labels, item_w):
+            p.setPen(Qt.NoPen)
+            p.setBrush(colour)
+            p.drawEllipse(QRectF(x, baseline - 9, 8, 8))
+            p.setFont(self._bold)
+            p.setPen(QColor("#f0f0f0"))
+            p.drawText(QPointF(x + 12, baseline), name)
+            p.setFont(self._font)
+            p.setPen(QColor("#8b8f9a"))
+            p.drawText(QPointF(x + 12 + bold_metrics.horizontalAdvance(name) + 4, baseline), text)
+            x += width + gap
+
+
+class InfoScreen(QFrame):
+    """Program size breakdown with the total top right; language breakdown, update note and AI disclaimer at the bottom."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         title = QLabel("Program size breakdown")
         title.setObjectName("infoHeader")
+        total = QLabel(f"Total size: {SizePage.total_mb():.1f} MB")
+        total.setObjectName("infoHeader")
+        head = QHBoxLayout()
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(total)
 
         footer = QHBoxLayout()
         footer.setSpacing(6)
@@ -1090,8 +1309,9 @@ class InfoScreen(QFrame):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(10)
-        lay.addWidget(title)
+        lay.addLayout(head)
         lay.addWidget(SizePage(), 1)
+        lay.addWidget(LanguageBar())
         lay.addLayout(footer)
 
 
@@ -1114,7 +1334,7 @@ class TitleBar(QWidget):
         self.info.setToolTip("Program info")
         self.cog = QPushButton()
         self.cog.setObjectName("cogBtn")
-        self.cog.setToolTip("Cleanup steps")
+        self.cog.setToolTip("Cleanup steps within Blender")
         cog_icon = QIcon()
         cog_icon.addPixmap(cog_pixmap(14, "#e6e6e6"), QIcon.Normal, QIcon.Off)
         cog_icon.addPixmap(cog_pixmap(14, "#1e1f24"), QIcon.Normal, QIcon.On)
@@ -1284,9 +1504,10 @@ class MainWindow(QWidget):
         self.open_btn.setCursor(Qt.PointingHandCursor)
         self.open_btn.setToolTip("Open output folder")
         self.open_btn.clicked.connect(self.open_output)
-        self.out_path = ElidedLabel()
+        self.out_path = ClickLabel()
         self.out_path.setObjectName("outPath")
         self.out_path.setFixedHeight(30)
+        self.out_path.clicked.connect(self.locate_blender)
 
         mode = QHBoxLayout()
         mode.setSpacing(0)
@@ -1365,8 +1586,22 @@ class MainWindow(QWidget):
         else:  # nothing loaded yet: this line carries the Blender check result
             self.out_path.setStyleSheet(f"color: {'#6d707a' if self._blender_ok else '#ff8b84'}; font-size: 12px;")
             self.out_path.set_full_text(self._blender_note)
-        self.out_path.setToolTip(folder or "")
+        self.out_path.set_clickable(not folder and not self._blender_ok)
+        self.out_path.setToolTip(folder or ("" if self._blender_ok else "Select the blender.exe of Blender 5.2 or newer"))
         self.out_btn.setText("Clear location" if self._custom_dir else "Change location")
+
+    def locate_blender(self):
+        """Lets the user pick blender.exe (portable copy, unusual install folder); remembered for next time."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select blender.exe", "", "Blender (blender.exe blender-launcher.exe)")
+        if not path:
+            return
+        if set_blender_path(path):
+            blender_installs(refresh=True)
+            self._blender_note, self._blender_ok = blender_status()
+        else:
+            self._blender_note, self._blender_ok = "That is not a blender.exe. Click here to select it", False
+        self.refresh_output()
+        self._update_controls()
 
     def open_output(self):
         folder = self.output_dir()

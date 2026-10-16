@@ -14,6 +14,7 @@ if not exist "%PY%" py -3.12 -m venv "%ROOT%\.venv"
 "%PY%" -m pip install --quiet -r "%BUILD%requirements.txt" pyinstaller || goto :failed
 "%PY%" "%BUILD%make_icon.py" || goto :failed
 "%PY%" "%BUILD%make_splash.py" || goto :failed
+"%PY%" "%BUILD%language_stats.py" || goto :failed
 "%PY%" -m PyInstaller --noconfirm --distpath "%OUT%" --workpath "%LOCALAPPDATA%\3DConvert\build" "%BUILD%3DConvert.spec" || goto :failed
 
 echo.

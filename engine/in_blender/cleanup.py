@@ -15,12 +15,37 @@ from mathutils import Matrix
 
 MERGE_DISTANCE = 0.0001
 DEGENERATE_DISTANCE = 0.000001
+POINTS_KEY = "point_set"  # custom property of an object that is a set of loose points on purpose (GIS points)
+GRID_KEY = "grid_mesh"  # temporary custom property of a terrain grid (quads only): its face layout needs no cleaning
 # Steps the user unticked in the app, comma separated (see CLEANUP_STEPS in app/main.py)
 OFF = {key for key in os.environ.get("CLEANUP_OFF", "").split(",") if key}
 
 
 def enabled(step):
     return step not in OFF
+
+
+def peak_memory_mb():
+    """Highest RAM this process has used so far (Windows); 0 when it cannot be read. Used to tune the RAM budget."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD), ("peak", ctypes.c_size_t),
+                        ("working", ctypes.c_size_t), ("pool_peak", ctypes.c_size_t), ("pool", ctypes.c_size_t),
+                        ("npool_peak", ctypes.c_size_t), ("npool", ctypes.c_size_t), ("pagefile", ctypes.c_size_t),
+                        ("pagefile_peak", ctypes.c_size_t)]
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel = ctypes.windll.kernel32
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        ok = psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb)
+        return counters.peak // 2 ** 20 if ok else 0
+    except Exception:  # only a diagnostic: it must never stop a conversion
+        return 0
 
 
 def _remove_attributes(mesh, names):
@@ -118,10 +143,65 @@ def _drop_unused_material_slots(mesh):
         mesh.polygons.foreach_set("material_index", lut[idx])
 
 
+def _flat_shade(mesh):
+    """Same result as mesh.shade_flat() (sharp_face on every face), which sets the flags one face at a time in Python."""
+    try:
+        attrs = mesh.attributes
+        attr = attrs.get("sharp_face")
+        if attr is not None and (attr.domain != "FACE" or attr.data_type != "BOOLEAN"):
+            attrs.remove(attr)
+            attr = None
+        if attr is None:
+            attr = attrs.new("sharp_face", "BOOLEAN", "FACE")
+        count = len(attr.data)
+        if count:
+            attr.data.foreach_set("value", np.ones(count, np.bool_))
+    except Exception:
+        mesh.shade_flat()
+
+
+def _topology(bm):
+    """Faces and edges of the bmesh as numpy arrays, in bmesh order, read through a scratch mesh so that no Python
+    loop over the elements is needed: (face sizes, face first corner, corner vertex, corner edge, edge vertices)."""
+    scratch = bpy.data.meshes.new("cleanup_scratch")
+    try:
+        bm.to_mesh(scratch)
+        faces, corners, edges = len(scratch.polygons), len(scratch.loops), len(scratch.edges)
+        starts = np.empty(faces, np.int32)
+        corner_vert = np.empty(corners, np.int32)
+        corner_edge = np.empty(corners, np.int32)
+        edge_verts = np.empty(edges * 2, np.int32)
+        scratch.polygons.foreach_get("loop_start", starts)
+        scratch.loops.foreach_get("vertex_index", corner_vert)
+        scratch.loops.foreach_get("edge_index", corner_edge)
+        scratch.edges.foreach_get("vertices", edge_verts)
+    finally:
+        bpy.data.meshes.remove(scratch)
+    sizes = np.diff(np.append(starts, corners))
+    return sizes, starts, corner_vert, corner_edge, edge_verts.reshape(-1, 2)
+
+
+def _twin_faces(sizes, starts, corner_vert):
+    """Indices of the faces that sit on exactly the same vertices as an earlier face."""
+    twins = []
+    for size in np.unique(sizes):
+        ids = np.nonzero(sizes == size)[0]
+        rows = np.sort(corner_vert[starts[ids][:, None] + np.arange(size)], axis=1)
+        order = np.lexsort(rows.T[::-1])  # stable: of equal rows the earliest face comes first
+        ordered = rows[order]
+        same = (ordered[1:] == ordered[:-1]).all(axis=1)
+        if same.any():
+            twins.append(ids[order[1:][same]])
+    return np.concatenate(twins) if twins else np.empty(0, np.int64)
+
+
 def clean_object(obj, shared):
     mesh = obj.data
     if len(mesh.polygons) == 0 and len(mesh.edges) == 0:
         return  # point sets (e.g. instance points) must keep coincident vertices
+    layout = enabled("quads") and not obj.get(GRID_KEY)  # a terrain grid already has the clean layout
+    if GRID_KEY in obj:
+        del obj[GRID_KEY]
 
     # Importers may leave mesh.users wrong, so count objects instead. Every sharer gets its own copy and
     # the orphaned original is purged at the end (never remove it by hand: a wrong count would drop live data).
@@ -133,7 +213,7 @@ def clean_object(obj, shared):
         _remove_ios_data(obj, mesh)
         _clear_special_data(obj, mesh)
     if enabled("flat"):
-        mesh.shade_flat()
+        _flat_shade(mesh)
         for name in (".uv_seam", "uv_seam", "sharp_edge"):
             if name in mesh.attributes:
                 try:
@@ -152,37 +232,50 @@ def clean_object(obj, shared):
     try:
         bm.from_mesh(mesh)
         if bm.verts and enabled("merge"):
-            bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=MERGE_DISTANCE)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=MERGE_DISTANCE)
         if bm.edges and enabled("degenerate"):
-            bmesh.ops.dissolve_degenerate(bm, edges=list(bm.edges), dist=DEGENERATE_DISTANCE)
+            bmesh.ops.dissolve_degenerate(bm, edges=bm.edges, dist=DEGENERATE_DISTANCE)
 
         # Meshes without faces keep their edges so line objects are not wiped.
         if bm.faces:
-            if enabled("duplicates"):  # faces that sit on exactly the same vertices
-                bm.verts.index_update()
-                seen, twins = set(), []
-                for face in bm.faces:
-                    key = tuple(sorted(v.index for v in face.verts))
-                    if key in seen:
-                        twins.append(face)
-                    else:
-                        seen.add(key)
-                if twins:
-                    bmesh.ops.delete(bm, geom=twins, context="FACES_ONLY")
+            twins = loose_edges = loose_verts = ngons = ()
+            if enabled("duplicates") or enabled("loose") or layout:
+                # Everything is looked up first (and on arrays), because deleting shifts the bmesh indices.
+                sizes, starts, corner_vert, corner_edge, edge_verts = _topology(bm)
+                bm.faces.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.verts.ensure_lookup_table()
+                twin_ids = _twin_faces(sizes, starts, corner_vert) if enabled("duplicates") else np.empty(0, np.int64)
+                twins = [bm.faces[i] for i in twin_ids]  # faces that sit on exactly the same vertices
+                if enabled("loose"):
+                    kept = np.ones(len(sizes), np.bool_)
+                    kept[twin_ids] = False  # edges that only a deleted twin used become loose too
+                    has_face = np.zeros(len(edge_verts), np.bool_)
+                    has_face[corner_edge[np.repeat(kept, sizes)]] = True
+                    in_edge = np.zeros(len(bm.verts), np.bool_)
+                    in_edge[edge_verts[has_face].ravel()] = True
+                    loose_edges = [bm.edges[i] for i in np.nonzero(~has_face)[0]]
+                    loose_verts = [bm.verts[i] for i in np.nonzero(~in_edge)[0]]
+                if layout:  # triangles need no triangulating
+                    big = sizes > 3
+                    big[twin_ids] = False
+                    ngons = [bm.faces[i] for i in np.nonzero(big)[0]]
+            if twins:
+                bmesh.ops.delete(bm, geom=twins, context="FACES_ONLY")
             if enabled("loose"):
-                loose_edges = [e for e in bm.edges if not e.link_faces]
                 if loose_edges:
                     bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
-                loose_verts = [v for v in bm.verts if not v.link_edges]
+                loose_verts = [v for v in loose_verts if v.is_valid]  # deleting the edges can remove some vertices too
                 if loose_verts:
                     bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
             if enabled("normals"):
-                bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
-            if enabled("quads"):
-                bmesh.ops.triangulate(bm, faces=list(bm.faces), quad_method="BEAUTY", ngon_method="BEAUTY")
+                bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+            if layout:
+                if ngons:
+                    bmesh.ops.triangulate(bm, faces=ngons, quad_method="BEAUTY", ngon_method="BEAUTY")
                 bmesh.ops.join_triangles(
                     bm,
-                    faces=list(bm.faces),
+                    faces=bm.faces,
                     angle_face_threshold=math.radians(40),
                     angle_shape_threshold=math.radians(40),
                     cmp_materials=True,
@@ -526,7 +619,8 @@ def remove_empty_meshes():
     if not enabled("emptymesh"):
         return
     _delete_keeping_children([o for o in bpy.data.objects
-                              if o.type == "MESH" and not len(o.data.polygons) and not len(o.data.edges)])
+                              if o.type == "MESH" and not len(o.data.polygons) and not len(o.data.edges)
+                              and not o.get(POINTS_KEY)])
 
 
 def remove_duplicate_objects():

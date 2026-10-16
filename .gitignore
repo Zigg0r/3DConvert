@@ -7,7 +7,7 @@ __pycache__/
 venv/
 dist/
 *.exe
-
+!engine/tools/libredwg/dwg2dxf.exe
 # Optional proprietary Trimble SketchUp libraries (not redistributable); without them OpenSKP (MIT) reads .skp files
 engine/wheels/sketchup_api*.whl
 

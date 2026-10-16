@@ -1,6 +1,6 @@
 # Third-party notices
 
-3DConvert is licensed under the GNU General Public License, version 3 or later (see [LICENSE](LICENSE)). It bundles and uses the third-party software listed here, each under its own license. Versions are the ones bundled with release 1.10. The license texts of most libraries are also inside their wheel files (`*.dist-info/licenses`).
+3DConvert is licensed under the GNU General Public License, version 3 or later (see [LICENSE](LICENSE)). It bundles and uses the third-party software listed here, each under its own license. Versions are the ones bundled with release 1.20. The license texts of most libraries are also inside their wheel files (`*.dist-info/licenses`).
 
 ## Libraries in `engine/wheels/`
 
@@ -23,7 +23,12 @@ These run inside the Python of Blender 5 and are unpacked to `%LOCALAPPDATA%\3DC
 | [typing_extensions](https://github.com/python/typing_extensions) | 4.16.0 | PSF-2.0 | Required by IfcOpenShell and ezdxf. |
 | [OpenSKP](https://github.com/iamahsanmehmood/openskp) | 1.3.0 | MIT | Reads `.skp` without any SketchUp software or SDK (reverse-engineered file format). Built from the `packages/python` folder of the project. |
 | [trimesh](https://github.com/mikedh/trimesh) | 5.1.1 | MIT | Required by OpenSKP. |
-| [defusedxml](https://github.com/tiran/defusedxml) | 0.7.1 | PSF-2.0 | Required by OpenSKP. |
+| [defusedxml](https://github.com/tiran/defusedxml) | 0.7.1 | PSF-2.0 | Required by OpenSKP. Also used for the KML, GPX and OSM readers. |
+| [laspy](https://github.com/laspy/laspy) | 2.7.0 | BSD-2-Clause | Reads `.las` and `.laz` point clouds. |
+| [lazrs](https://github.com/laz-rs/laz-rs-python) | 0.8.2 | MIT | LAZ decompression for laspy. The wheel lists its Rust dependencies in `lazrs.cyclonedx.json`. |
+| [pye57](https://github.com/davidcaron/pye57) | 0.4.19 | MIT | Reads `.e57` point clouds. The wheel contains libE57Format (BSL-1.0) and Xerces-C 3.2 (Apache-2.0). |
+| [pyquaternion](https://github.com/KieranWynn/pyquaternion) | 0.9.9 | MIT | Required by pye57. |
+| [assimp_py](https://github.com/ranjian0/assimp_py) | 1.2.0 | MIT | Python binding of the Open Asset Import Library (ASSIMP 6.0.5, BSD-3-Clause; its license is in the wheel). Reads the older and game formats. |
 | `sketchup` module (optional) | 0.27 | GPL-3.0-or-later | Taken unmodified from the SketchUp Importer add-on 0.27 (Martijn Berger and contributors). |
 | SketchUp C API (`SketchUpAPI.dll`, `SketchUpCommonPreferences.dll`) (optional) | as shipped with that add-on | Proprietary, Trimble Inc. | Not covered by the GPL. See the SketchUp note below. |
 
@@ -34,6 +39,15 @@ The `sketchup` module and the two SketchUp libraries are packed in `sketchup_api
 | Add-on | Version | License | Notes |
 |---|---|---|---|
 | [Import Autodesk MAX (`io_scene_max`)](https://github.com/nrgsille76/io_scene_max) | 1.9.2 | GPL-3.0-or-later (manifest); GPL-2.0-or-later (source file headers) | Copyright 2023-2026 Sebastian Schrand, 2017-2022 Jens M. Plonka, 2005-2018 Philippe Lagadec. Based on `olefile` and on the ImportMAX importer of FreeCAD. |
+
+## Programs in `engine/tools/`
+
+Unmodified files of the official Windows release zip `libredwg-0.14.8612-win64.zip` (SHA-256 `898b478e87b21785b90ace86efcb5670af8ba80468b3eab34027bb82a3a8f259`) from https://github.com/LibreDWG/libredwg/releases/tag/0.14.8612. The complete source code of LibreDWG is at https://github.com/LibreDWG/libredwg (also in the release's `libredwg-0.14.8612.tar.gz`). They are run as a separate process; `dwg2dxf.exe` reads a DWG and writes a DXF.
+
+| Component | Version | License | Notes |
+|---|---|---|---|
+| [LibreDWG](https://www.gnu.org/software/libredwg/) (`dwg2dxf.exe`, `libredwg-0.dll`) | 0.14.8612 (nightly Windows build) | GPL-3.0-or-later | Reads `.dwg` into DXF when the ODA File Converter is not installed. |
+| [GNU libiconv](https://www.gnu.org/software/libiconv/) (`libiconv-2.dll`) | as shipped in that release | LGPL-2.1-or-later | Character set conversion for LibreDWG. Source: https://ftp.gnu.org/gnu/libiconv/. |
 
 ## Inside the exe
 
@@ -50,14 +64,14 @@ The `sketchup` module and the two SketchUp libraries are packed in `sketchup_api
 |---|---|---|
 | [Blender](https://www.blender.org) | GNU GPL, version 3 or later | Must be installed separately. 3DConvert starts it in the background. |
 | NumPy | BSD-3-Clause | Provided by the Python of Blender; the bundled libraries rely on it. |
-| ODA File Converter | Proprietary freeware, Open Design Alliance | Optional, only for `.dwg`. Installed by the user, not distributed here. |
+| ODA File Converter | Proprietary freeware, Open Design Alliance | Optional, for `.dwg` and for DXF files with solids. Installed by the user (or its MSI unpacked into `%LOCALAPPDATA%\3DConvert\ODA`), not distributed here; its license does not allow redistribution with other software. |
 
 ## Program icons (`assets/icons/`)
 
-The logo tiles on the supported-formats page are made from the [Simple Icons](https://simpleicons.org) glyphs (CC0-1.0) of Blender, AutoCAD, Autodesk, SketchUp, Rhinoceros, glTF and the Khronos Group. The logos are trademarks of their owners and are shown only to identify the programs whose files can be opened; no endorsement is implied. A PNG with the same name in `assets/icons/` replaces an icon.
+The logo tiles on the supported-formats page are made from the [Simple Icons](https://simpleicons.org) glyphs (CC0-1.0) of Blender, AutoCAD, Autodesk, SketchUp, Rhinoceros, glTF, the Khronos Group, Unity, Google Earth, OpenStreetMap, QGIS and Esri. The logos are trademarks of their owners and are shown only to identify the programs whose files can be opened; no endorsement is implied. A PNG with the same name in `assets/icons/` replaces an icon.
 
 ## Notes
 
-- **LGPL libraries** (Qt/PySide6, IfcOpenShell, Open CASCADE, GEOS). The complete source of 3DConvert and its build script are in this repository, so the exe can be rebuilt with a modified PySide6 (change `build/requirements.txt`). The libraries in `engine/wheels/` are separate files and can be replaced by other builds of the same library.
+- **LGPL libraries** (Qt/PySide6, IfcOpenShell, Open CASCADE, GEOS, libiconv). The complete source of 3DConvert and its build script are in this repository, so the exe can be rebuilt with a modified PySide6 (change `build/requirements.txt`). The libraries in `engine/wheels/` and the DLLs in `engine/tools/` are separate files and can be replaced by other builds of the same library.
 - **SketchUp.** OpenSKP (MIT) is the license-clean reader and is always bundled. The optional `sketchup` module loads the SketchUp C API libraries of Trimble Inc. They are proprietary, come from Trimble's SketchUp C SDK (which is available on request only, under its own license agreement) and are distributed by the SketchUp Importer add-on. The SDK license text is not public; check it with Trimble before redistributing the files yourself, or leave `sketchup_api-0.27-cp313-none-win_amd64.whl` out of the repository and the exe (it is listed in `.gitignore`). Without it `.skp` files are read by OpenSKP, which is slower on very large models and does not mark single hidden groups or faces.
 - **Scripts that run inside Blender** (`engine/in_blender/`) use Blender's Python API, which is why 3DConvert as a whole is distributed under the GPL.
